@@ -1,0 +1,110 @@
+-- mark-watched: marks a YouTube video as "watched" in the user's real
+-- YouTube account once enough of it has actually played, via yt-dlp's own
+-- --mark-watched flag - a real POST to YouTube's watch-history endpoint,
+-- authenticated through the browser cookies already configured globally
+-- for yt-dlp (see ~/.config/yt-dlp/config's --cookies-from-browser).
+-- --simulate keeps this a pure metadata/side-effect call: nothing gets
+-- (re-)downloaded.
+--
+-- mpv plays YouTube URLs by resolving a raw stream via yt-dlp and
+-- streaming that directly - it never touches youtube.com's own web
+-- player, so none of YouTube's normal watch-history tracking happens on
+-- its own. This script is what makes that happen instead.
+--
+-- Fires once per file, the first time EITHER a minimum watched-seconds OR
+-- a minimum watched-percentage is reached, whichever comes first -
+-- deliberately not "as soon as playback starts": a video clicked and
+-- immediately skipped was not actually watched, and letting that count
+-- would feed YouTube's recommender the wrong signal, undermining the
+-- whole point of doing this.
+
+local options = require "mp.options"
+local msg = require "mp.msg"
+
+local opts = {
+    enabled = true,
+    min_seconds = 30,
+    min_percent = 50,
+}
+options.read_options(opts, "mark_watched")
+
+-- Strips a possible ytdl:// prefix ytdl_hook can leave on the live `path`
+-- property (mirrors playlist_manager.lua/perpetual_playlist.lua's own
+-- normalize_url) before matching against youtube.com/youtu.be.
+local function is_youtube_url(path)
+    if type(path) ~= "string" then return false end
+    local url = path:gsub("^ytdl://", "")
+    return url:match("^https?://[^/]*youtube%.com/") ~= nil
+        or url:match("^https?://youtu%.be/") ~= nil
+end
+
+local current_url = nil
+local marked_this_file = false
+
+-- No --cookies-from-browser here deliberately - relies on the
+-- --cookies-from-browser already in yt-dlp's own global config
+-- (~/.config/yt-dlp/config), same as playlist_manager.lua's and
+-- ytdl-cache-wrapper's own bare `yt-dlp` calls already do implicitly -
+-- keeps the machine-specific browser choice in one place instead of
+-- duplicated here.
+local function mark_watched(url)
+    msg.info("marking watched: " .. url)
+    mp.command_native_async({
+        name = "subprocess",
+        args = {"yt-dlp", "--simulate", "--mark-watched", url},
+        playback_only = false,
+        capture_stdout = true,
+        capture_stderr = true,
+    }, function(success, res)
+        if not success or not res or res.status ~= 0 then
+            local err = res and res.stderr or ""
+            msg.warn("failed to mark watched: " .. url .. (err ~= "" and (" (" .. err .. ")") or ""))
+        else
+            msg.debug("marked watched: " .. url)
+        end
+    end)
+end
+
+mp.register_event("file-loaded", function()
+    marked_this_file = false
+    local path = mp.get_property("path")
+    if opts.enabled and is_youtube_url(path) then
+        current_url = path:gsub("^ytdl://", "")
+    else
+        current_url = nil
+    end
+end)
+
+-- A property observer, not a wall-clock mp.add_timeout, deliberately -
+-- correctly tracks actual watched time (a pause doesn't advance
+-- time-pos), at the cost of firing on every position update. Cheap once
+-- marked (or once not a YouTube file): both early-return on their very
+-- first check, so this never repeats ytdl_prefetch.lua's documented
+-- near-end-of-video polling/audio-crackling issue (that was from real
+-- per-call work - cache_key subprocess calls - concentrated at the tail
+-- of every video; this is a couple of nil/boolean checks).
+mp.observe_property("time-pos", "number", function(_, pos)
+    if marked_this_file or not current_url or not pos then return end
+    if pos >= opts.min_seconds then
+        marked_this_file = true
+        mark_watched(current_url)
+        return
+    end
+    local duration = mp.get_property_number("duration")
+    if duration and duration > 0 and (pos / duration * 100) >= opts.min_percent then
+        marked_this_file = true
+        mark_watched(current_url)
+    end
+end)
+
+-- Safety net: a video that genuinely finishes (eof) before either
+-- threshold was reached (very short clips, or a duration property that
+-- was never available) is unambiguously "watched" regardless. Mirrors
+-- perpetual_playlist.lua's own event.reason == "eof" idiom for detecting
+-- genuine completion.
+mp.register_event("end-file", function(event)
+    if event.reason == "eof" and current_url and not marked_this_file then
+        marked_this_file = true
+        mark_watched(current_url)
+    end
+end)
