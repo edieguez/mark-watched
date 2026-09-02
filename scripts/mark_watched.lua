@@ -16,17 +16,104 @@
 -- deliberately not "as soon as playback starts": a video clicked and
 -- immediately skipped was not actually watched, and letting that count
 -- would feed YouTube's recommender the wrong signal, undermining the
--- whole point of doing this.
+-- whole point of doing this. See `algorithm`/`profile` below for the
+-- available timing strategies and how to switch between them.
 
 local options = require "mp.options"
 local msg = require "mp.msg"
 
 local opts = {
     enabled = true,
+
+    -- Which algorithm decides when a video counts as "watched":
+    --   threshold - fires once EITHER min_seconds or min_percent is
+    --                reached (see `profile` for named presets)
+    --   adaptive  - percent-watched target scales with the video's own
+    --                duration instead of a flat number (see the
+    --                adaptive_* options below)
+    algorithm = "threshold",
+
+    -- threshold algorithm: a named preset for min_seconds/min_percent -
+    -- see PROFILES below for what each one means. "custom" uses the
+    -- min_seconds/min_percent values below directly; every other profile
+    -- overrides them.
+    profile = "balanced",
     min_seconds = 30,
     min_percent = 50,
+
+    -- adaptive algorithm: percent target linearly interpolated between
+    -- (adaptive_short_minutes, adaptive_short_percent) and
+    -- (adaptive_long_minutes, adaptive_long_percent), clamped at both
+    -- ends - short videos need a bigger fraction watched to count,
+    -- long ones a smaller one. adaptive_min_seconds is a floor under
+    -- that percent, for degenerate very-short-duration edge cases.
+    adaptive_short_minutes = 2,
+    adaptive_short_percent = 70,
+    adaptive_long_minutes = 20,
+    adaptive_long_percent = 15,
+    adaptive_min_seconds = 5,
 }
 options.read_options(opts, "mark_watched")
+
+-- Named threshold-algorithm presets. immediate/seconds_only/percent_only/
+-- near_completion are just different min_seconds/min_percent values, not
+-- different logic - naming them here avoids hand-tuning the same handful
+-- of combinations repeatedly. 101/1e9 are deliberate "never reached this
+-- way" sentinels so the OR-check in the time-pos observer below still
+-- degrades to a single effective condition without a separate code path.
+local PROFILES = {
+    immediate       = {min_seconds = 0,   min_percent = 0},
+    seconds_only    = {min_seconds = 30,  min_percent = 101},
+    percent_only    = {min_seconds = 1e9, min_percent = 50},
+    balanced        = {min_seconds = 30,  min_percent = 50},
+    near_completion = {min_seconds = 1e9, min_percent = 90},
+}
+
+-- Both validated once here, not inside threshold_targets() below - that
+-- function runs on every time-pos tick, and a msg.warn there for an
+-- invalid value would repeat dozens of times a second instead of once
+-- (caught empirically while testing: the whole point of doing this once,
+-- up front, isn't just style - it's what keeps a typo'd options file from
+-- flooding the log).
+if opts.algorithm ~= "threshold" and opts.algorithm ~= "adaptive" then
+    msg.warn("unknown algorithm '" .. tostring(opts.algorithm) .. "', using threshold")
+    opts.algorithm = "threshold"
+end
+if opts.profile ~= "custom" and not PROFILES[opts.profile] then
+    msg.warn("unknown profile '" .. tostring(opts.profile) .. "', using custom min_seconds/min_percent")
+    opts.profile = "custom"
+end
+
+-- Resolves the (target_seconds, target_percent) pair for the threshold
+-- algorithm's current profile - a plain table lookup, "custom" simply
+-- never being a PROFILES key is what makes it fall through to
+-- min_seconds/min_percent below.
+local function threshold_targets()
+    local p = PROFILES[opts.profile]
+    if p then return p.min_seconds, p.min_percent end
+    return opts.min_seconds, opts.min_percent
+end
+
+-- Resolves the (target_seconds, target_percent) pair for the adaptive
+-- algorithm: target_percent slides linearly between adaptive_short_percent
+-- (at or below adaptive_short_minutes) and adaptive_long_percent (at or
+-- above adaptive_long_minutes), clamped at both ends. A nil/unknown
+-- duration is treated as 0 minutes (the short-video end of the scale) -
+-- the min_seconds floor still applies either way.
+local function adaptive_targets(duration)
+    local minutes = (duration or 0) / 60
+    local sm, sp = opts.adaptive_short_minutes, opts.adaptive_short_percent
+    local lm, lp = opts.adaptive_long_minutes, opts.adaptive_long_percent
+    local percent
+    if minutes <= sm then
+        percent = sp
+    elseif minutes >= lm then
+        percent = lp
+    else
+        percent = sp + (minutes - sm) / (lm - sm) * (lp - sp)
+    end
+    return opts.adaptive_min_seconds, percent
+end
 
 -- Strips a possible ytdl:// prefix ytdl_hook can leave on the live `path`
 -- property (mirrors playlist_manager.lua/perpetual_playlist.lua's own
@@ -85,13 +172,27 @@ end)
 -- of every video; this is a couple of nil/boolean checks).
 mp.observe_property("time-pos", "number", function(_, pos)
     if marked_this_file or not current_url or not pos then return end
-    if pos >= opts.min_seconds then
+
+    local duration = mp.get_property_number("duration")
+    local target_seconds, target_percent
+    if opts.algorithm == "adaptive" then
+        target_seconds, target_percent = adaptive_targets(duration)
+    else
+        target_seconds, target_percent = threshold_targets()
+    end
+
+    if pos >= target_seconds then
+        msg.debug(string.format(
+            "%s: watched-seconds threshold hit (target %.1fs/%.0f%%)",
+            current_url, target_seconds, target_percent))
         marked_this_file = true
         mark_watched(current_url)
         return
     end
-    local duration = mp.get_property_number("duration")
-    if duration and duration > 0 and (pos / duration * 100) >= opts.min_percent then
+    if duration and duration > 0 and (pos / duration * 100) >= target_percent then
+        msg.debug(string.format(
+            "%s: watched-percent threshold hit (target %.1fs/%.0f%%)",
+            current_url, target_seconds, target_percent))
         marked_this_file = true
         mark_watched(current_url)
     end
