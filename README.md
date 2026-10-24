@@ -22,7 +22,8 @@ handle that:
 
 - **`threshold`** (the default) - marks watched once **either**
   `min_seconds` of actual playback **or** `min_percent` of the video's
-  duration is reached, whichever comes first. Several named `profile`
+  duration has actually been played, whichever comes first. Seeking ahead
+  does not count. Several named `profile`
   presets pick common combinations for you (`immediate`, `seconds_only`,
   `percent_only`, `balanced` - the default, 30s/50% - and
   `near_completion`, ~90%) instead of hand-tuning the two numbers; set

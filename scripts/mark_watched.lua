@@ -12,9 +12,11 @@
 -- its own. This script is what makes that happen instead.
 --
 -- Fires once per file, the first time EITHER a minimum watched-seconds OR
--- a minimum watched-percentage is reached, whichever comes first -
--- deliberately not "as soon as playback starts": a video clicked and
--- immediately skipped was not actually watched, and letting that count
+-- a minimum watched-percentage is reached, whichever comes first. Both
+-- count time actually played, not the playhead position - seeking ahead
+-- does not count - and deliberately not "as soon as playback starts": a
+-- video clicked and immediately skipped was not actually watched, and
+-- letting that count
 -- would feed YouTube's recommender the wrong signal, undermining the
 -- whole point of doing this. See `algorithm`/`profile` below for the
 -- available timing strategies and how to switch between them.
@@ -127,6 +129,11 @@ end
 
 local current_url = nil
 local marked_this_file = false
+-- Seconds actually played this file, summed from small time-pos steps.
+-- A seek is a big jump and is not counted, so skipping to 90% does not
+-- count as having watched 90%.
+local watched = 0
+local last_pos = nil
 
 -- No --cookies-from-browser here deliberately - relies on the
 -- --cookies-from-browser already in yt-dlp's own global config
@@ -154,6 +161,8 @@ end
 
 mp.register_event("file-loaded", function()
     marked_this_file = false
+    watched = 0
+    last_pos = nil
     local path = mp.get_property("path")
     if opts.enabled and is_youtube_url(path) then
         current_url = path:gsub("^ytdl://", "")
@@ -173,6 +182,14 @@ end)
 mp.observe_property("time-pos", "number", function(_, pos)
     if marked_this_file or not current_url or not pos then return end
 
+    if last_pos then
+        local delta = pos - last_pos
+        if delta > 0 and delta <= 1 then
+            watched = watched + delta
+        end
+    end
+    last_pos = pos
+
     local duration = mp.get_property_number("duration")
     local target_seconds, target_percent
     if opts.algorithm == "adaptive" then
@@ -181,7 +198,7 @@ mp.observe_property("time-pos", "number", function(_, pos)
         target_seconds, target_percent = threshold_targets()
     end
 
-    if pos >= target_seconds then
+    if watched >= target_seconds then
         msg.debug(string.format(
             "%s: watched-seconds threshold hit (target %.1fs/%.0f%%)",
             current_url, target_seconds, target_percent))
@@ -189,7 +206,7 @@ mp.observe_property("time-pos", "number", function(_, pos)
         mark_watched(current_url)
         return
     end
-    if duration and duration > 0 and (pos / duration * 100) >= target_percent then
+    if duration and duration > 0 and (watched / duration * 100) >= target_percent then
         msg.debug(string.format(
             "%s: watched-percent threshold hit (target %.1fs/%.0f%%)",
             current_url, target_seconds, target_percent))
